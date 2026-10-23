@@ -5,31 +5,75 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from bumble import device, hci, transport
+from bumble import core, device, hci, transport
 from bumble.core import AdvertisingData
 from bumble.profiles import bap, le_audio, pbp
+from lc3 import BaseError as LC3Error
 from lc3 import Encoder
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
 
 LOGGER = logging.getLogger(__name__)
 LC3_BITRATE = 160_000
 CONTROLLER_STACK_SETUP_KEY = "_controller_stack"
+TEARDOWN_STEP_TIMEOUT = 2.0
+DRAIN_TIMEOUT = 2.0
+# Errors raised by Bumble, the serial transport (OSError, including timeouts) and liblc3
+BROADCAST_ERRORS = (core.BaseBumbleError, LC3Error, OSError)
+REQUIRED_LE_FEATURES = {
+    "LE Periodic Advertising": hci.LeFeatureMask.LE_PERIODIC_ADVERTISING,
+    "LE Extended Advertising": hci.LeFeatureMask.LE_EXTENDED_ADVERTISING,
+    "Isochronous Broadcaster": hci.LeFeatureMask.ISOCHRONOUS_BROADCASTER,
+}
+REQUIRED_HCI_COMMANDS = {
+    "LE Create BIG": hci.HCI_LE_CREATE_BIG_COMMAND,
+    "LE Terminate BIG": hci.HCI_LE_TERMINATE_BIG_COMMAND,
+    "LE Setup ISO Data Path": hci.HCI_LE_SETUP_ISO_DATA_PATH_COMMAND,
+    "LE Read Buffer Size V2": hci.HCI_LE_READ_BUFFER_SIZE_V2_COMMAND,
+}
 
 
 @dataclass(frozen=True, slots=True)
 class ControllerProbeResult:
     """HCI capabilities and identity discovered on a controller."""
 
-    supports_le_periodic_advertising: bool
+    missing_support: tuple[str, ...]
     controller_stack: str | None
 
+    @property
+    def supports_auracast(self) -> bool:
+        """Return whether the controller can transmit an Auracast broadcast."""
+        return not self.missing_support
 
-async def probe_controller(serial_port: str, baudrate: int) -> ControllerProbeResult | None:
+
+def find_missing_auracast_support(controller_device: device.Device) -> tuple[str, ...]:
+    """
+    Return the LE features and HCI commands a powered-on controller lacks for broadcasting.
+
+    :param controller_device: A Bumble device whose host completed controller initialization.
+    """
+    missing = [
+        name
+        for name, feature in REQUIRED_LE_FEATURES.items()
+        if not controller_device.supports_le_features(feature)
+    ]
+    missing.extend(
+        name
+        for name, op_code in REQUIRED_HCI_COMMANDS.items()
+        if not controller_device.host.supports_command(op_code)
+    )
+    return tuple(missing)
+
+
+async def probe_controller(serial_port: str, baudrate: int) -> ControllerProbeResult:
     """
     Probe a serial port for a usable Auracast controller.
+
+    Raises the Bumble, serial or timeout errors when the controller cannot be opened.
 
     :param serial_port: Path to the controller's UART device.
     :param baudrate: UART baud rate.
@@ -44,28 +88,23 @@ async def probe_controller(serial_port: str, baudrate: int) -> ControllerProbeRe
             device.DeviceConfiguration(name="Auracast setup probe"), hci_source, hci_sink
         )
         await asyncio.wait_for(controller_device.power_on(), timeout=5)
-        supported = bool(controller_device.supports_le_periodic_advertising)
+        missing_support = find_missing_auracast_support(controller_device)
         version = controller_device.host.local_version
         controller_stack = _format_controller_stack(version) if version is not None else None
         LOGGER.debug(
-            "Auracast controller probe on %s completed: LE periodic advertising=%s, "
+            "Auracast controller probe on %s completed: missing support=%s, "
             "HCI version=%s, controller stack=%s",
             serial_port,
-            supported,
+            missing_support,
             version,
             controller_stack,
         )
-        return ControllerProbeResult(supported, controller_stack)
-    except Exception:
-        LOGGER.debug("Auracast controller probe failed on %s", serial_port, exc_info=True)
-        return None
+        return ControllerProbeResult(missing_support, controller_stack)
     finally:
         if controller_device:
-            with suppress(Exception):
-                await asyncio.wait_for(controller_device.power_off(), timeout=2)
+            await _teardown_step(controller_device.power_off(), "powering off probed controller")
         if controller_transport:
-            with suppress(Exception):
-                await controller_transport.close()
+            await _teardown_step(controller_transport.close(), "closing probed transport")
 
 
 def parse_manufacturer_data(value: str | None) -> dict[int, bytes] | None:
@@ -157,6 +196,7 @@ class AuracastBroadcaster:
         if self.config.broadcast_id == 0:
             self.config.broadcast_id = secrets.randbelow(0x1000000)
 
+        started = False
         try:
             LOGGER.debug(
                 "Starting Auracast broadcast %r over %s: LC3 bitrate=%d, sample_rate=%d, "
@@ -190,20 +230,25 @@ class AuracastBroadcaster:
             await self._read_controller_stack()
             self._validate_controller()
             await self._create_broadcast()
-        except asyncio.CancelledError:
-            LOGGER.debug("Auracast broadcast startup was cancelled")
-            await self.stop()
-            raise
-        except Exception:
-            LOGGER.exception("Failed to start Auracast broadcast over %s", config.transport_spec)
-            await self.stop()
-            raise
-        except BaseException:
-            await self.stop()
-            raise
+            started = True
+        finally:
+            if not started:
+                await self.stop()
+
+    @property
+    def queued_seconds(self) -> float:
+        """Return the duration of audio submitted but not yet transmitted."""
+        if not self._streams:
+            return 0.0
+        pending_sdus = self._streams[0].data_packet_queue.pending
+        return pending_sdus / len(self._streams) * self.config.frame_duration_us / 1_000_000
 
     async def send_pcm(self, pcm: bytes) -> None:
-        """Encode complete PCM frames and submit one SDU per BIS."""
+        """
+        Encode complete PCM frames and submit one SDU per BIS.
+
+        :param pcm: Interleaved 16-bit little-endian PCM; a trailing partial frame is buffered.
+        """
         if not self.running or self._encoder is None:
             return
         self._pcm_buffer.extend(pcm)
@@ -211,65 +256,65 @@ class AuracastBroadcaster:
         while len(self._pcm_buffer) >= bytes_per_pcm_frame:
             pcm_frame = bytes(self._pcm_buffer[:bytes_per_pcm_frame])
             del self._pcm_buffer[:bytes_per_pcm_frame]
-            encoded = self._encoder.encode(pcm_frame, num_bytes=self._frame_bytes, bit_depth=16)
-            await asyncio.gather(
-                *(
-                    stream.write(
-                        encoded[index * self._bytes_per_bis : (index + 1) * self._bytes_per_bis]
-                    )
-                    for index, stream in enumerate(self._streams)
-                )
+            await self._submit_frame(pcm_frame)
+
+    async def drain(self) -> None:
+        """Pad and submit any buffered partial frame, then wait until all SDUs are transmitted."""
+        if not self.running or self._big is None:
+            return
+        if self._pcm_buffer:
+            bytes_per_pcm_frame = self._samples_per_frame * self.config.channels * 2
+            padding = bytes_per_pcm_frame - len(self._pcm_buffer)
+            await self.send_pcm(bytes(padding))
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(link.drain() for link in self._big.bis_links)),
+                timeout=DRAIN_TIMEOUT,
             )
+        except TimeoutError:
+            LOGGER.warning("Timed out waiting for the Auracast broadcast queue to drain")
 
     async def stop(self) -> None:
         """Stop the BIG and close the controller transport."""
         big, self._big = self._big, None
         if big:
-            try:
-                await asyncio.wait_for(big.terminate(), timeout=2.0)
-            except TimeoutError:
-                LOGGER.warning("Timed out terminating Auracast BIG")
-            except Exception:
-                LOGGER.exception("Failed to terminate Auracast BIG")
+            await _teardown_step(big.terminate(), "terminating the Auracast BIG")
 
         advertising_set, self._advertising_set = self._advertising_set, None
         if advertising_set:
-            try:
-                await asyncio.wait_for(advertising_set.stop(), timeout=2.0)
-            except TimeoutError:
-                LOGGER.warning("Timed out stopping Auracast advertising")
-            except Exception:
-                LOGGER.exception("Failed to stop Auracast advertising")
+            await _teardown_step(advertising_set.stop(), "stopping Auracast advertising")
 
         current_device, self._device = self._device, None
         if current_device:
-            try:
-                await asyncio.wait_for(current_device.power_off(), timeout=2.0)
-            except TimeoutError:
-                LOGGER.warning("Timed out powering off Auracast controller")
-            except Exception:
-                LOGGER.exception("Failed to power off Auracast controller")
+            await _teardown_step(current_device.power_off(), "powering off the controller")
 
         current_transport, self._transport = self._transport, None
         if current_transport:
-            try:
-                await current_transport.close()
-            except Exception:
-                LOGGER.exception("Failed to close Auracast controller transport")
+            await _teardown_step(current_transport.close(), "closing the controller transport")
         self._streams.clear()
         self._encoder = None
         self._pcm_buffer.clear()
 
-    def _validate_controller(self) -> None:
-        """Raise when the controller lacks periodic advertising support."""
-        if self._device:
-            LOGGER.debug(
-                "Controller LE periodic advertising support: %s",
-                self._device.supports_le_periodic_advertising,
+    async def _submit_frame(self, pcm_frame: bytes) -> None:
+        """Encode one PCM frame with LC3 and write each channel to its BIS."""
+        assert self._encoder is not None
+        encoded = self._encoder.encode(pcm_frame, num_bytes=self._frame_bytes, bit_depth=16)
+        await asyncio.gather(
+            *(
+                stream.write(
+                    encoded[index * self._bytes_per_bis : (index + 1) * self._bytes_per_bis]
+                )
+                for index, stream in enumerate(self._streams)
             )
-        if self._device and not self._device.supports_le_periodic_advertising:
-            raise RuntimeError(
-                "The Bluetooth controller must support LE Periodic Advertising for Auracast"
+        )
+
+    def _validate_controller(self) -> None:
+        """Raise when the controller cannot transmit an Auracast broadcast."""
+        assert self._device is not None
+        if missing := find_missing_auracast_support(self._device):
+            raise core.NotSupportedError(
+                f"The Bluetooth controller does not support Auracast broadcasting: "
+                f"missing {', '.join(missing)}"
             )
 
     async def _read_controller_stack(self) -> None:
@@ -383,6 +428,21 @@ class AuracastBroadcaster:
             config.presentation_delay_us,
         )
         LOGGER.info("Broadcasting %s with %d BIS streams", config.name, len(self._streams))
+
+
+async def _teardown_step(step: Awaitable[None], description: str) -> None:
+    """
+    Run one best-effort teardown step, logging a timeout or Bumble/serial failure.
+
+    :param step: The awaitable to run.
+    :param description: What the step does, used in log messages.
+    """
+    try:
+        await asyncio.wait_for(step, timeout=TEARDOWN_STEP_TIMEOUT)
+    except TimeoutError:
+        LOGGER.warning("Timed out %s", description)
+    except BROADCAST_ERRORS as err:
+        LOGGER.warning("Failed %s: %s", description, err)
 
 
 def _format_controller_stack(parameters: Any) -> str:

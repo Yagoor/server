@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncGenerator
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
-from music_assistant_models.enums import PlayerFeature
+from music_assistant_models.enums import PlaybackState, PlayerFeature
+from music_assistant_models.errors import PlayerUnavailableError
 
 from music_assistant.models.player import PlayerMedia
-from music_assistant.providers.auracast.broadcaster import CONTROLLER_STACK_SETUP_KEY
+from music_assistant.providers.auracast.broadcaster import (
+    CONTROLLER_STACK_SETUP_KEY,
+    AuracastBroadcaster,
+)
 from music_assistant.providers.auracast.player import PCM_FORMAT, AuracastPlayer, _apply_volume
+
+PLAYER_MODULE = "music_assistant.providers.auracast.player"
 
 
 def create_player() -> AuracastPlayer:
@@ -20,50 +27,238 @@ def create_player() -> AuracastPlayer:
     mass = MagicMock()
     mass.config.get_base_player_config.return_value = MagicMock()
     mass.config.get_raw_player_config_value.return_value = 100
+    mass.streams.audio.get_player_output_plan.return_value = MagicMock(filter_params=[])
+    mass.create_task = lambda coro: asyncio.create_task(coro)
     provider = MagicMock()
     provider.mass = mass
     provider.logger = logging.getLogger("test.auracast")
     provider.instance_id = "auracast_test"
-    provider.config.get_value.side_effect = lambda _key, default=None: default
+    provider.config.get_value.side_effect = lambda key, default=None: (
+        "/dev/test" if key == "serial_port" else default
+    )
     provider.get_setup_value.side_effect = lambda _key, default=None: default
     return AuracastPlayer(provider, "auracast_test")
 
 
-async def pcm_source(chunk: bytes) -> AsyncGenerator[bytes]:
-    """Yield a single PCM chunk."""
-    yield chunk
+def stub_broadcaster(player: Any) -> None:
+    """Replace the player's broadcaster I/O with mocks."""
+    player._broadcaster.start = AsyncMock()
+    player._broadcaster.stop = AsyncMock()
+    player._broadcaster.send_pcm = AsyncMock()
+    player._broadcaster.drain = AsyncMock()
+    player.update_state = MagicMock()
+
+
+async def pcm_source(*chunks: bytes) -> AsyncGenerator[bytes]:
+    """Yield the given PCM chunks."""
+    for chunk in chunks:
+        yield chunk
+
+
+async def wait_for_idle(player: Any) -> None:
+    """Wait until the player released its broadcast after the stream ended on its own."""
+    for _ in range(200):
+        if player._stream_task is None:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("Player never released the broadcast")
 
 
 @pytest.mark.asyncio
-async def test_play_media_streams_pcm_and_closes_broadcast_on_eof() -> None:
-    """Request decoded PCM, forward it, and release the broadcast after EOF."""
+async def test_play_media_streams_pcm_and_releases_broadcast_after_eof() -> None:
+    """Request decoded PCM, forward it, drain it, and release the broadcast once after EOF."""
     player = cast("Any", create_player())
     media = MagicMock(spec=PlayerMedia)
     chunk = bytes(480 * 2 * 2)
     player.mass.streams.get_stream.return_value = pcm_source(chunk)
-    player._broadcaster.start = AsyncMock()
-    player._broadcaster.stop = AsyncMock()
-    player._broadcaster.send_pcm = AsyncMock()
+    stub_broadcaster(player)
     player._broadcaster.controller_stack = (
         "Bluetooth Core 5.2; company ID 0x0057; HCI revision 0x1234; "
         "LMP version 11; firmware revision 0x5678"
     )
-    player.update_state = MagicMock()
 
     await player.play_media(media)
-    assert player._stream_task is not None
-    await player._stream_task
+    assert player.playback_state == PlaybackState.PLAYING
+    await wait_for_idle(player)
 
     player.mass.streams.get_stream.assert_called_once_with(media, PCM_FORMAT, player.player_id)
     player._broadcaster.start.assert_awaited_once()
     player._broadcaster.send_pcm.assert_awaited_once_with(chunk)
+    player._broadcaster.drain.assert_awaited_once()
+    # one stop to clear any previous broadcast before starting, one after the stream ended
     assert player._broadcaster.stop.await_count == 2
     assert player.current_media is None
+    assert player.playback_state == PlaybackState.IDLE
     assert player.device_info.manufacturer == "Bluetooth SIG"
     assert player.device_info.model == (
         "Host stack: Bumble; Controller stack: Bluetooth Core 5.2; company ID 0x0057; "
         "HCI revision 0x1234; LMP version 11; firmware revision 0x5678"
     )
+
+
+@pytest.mark.asyncio
+async def test_play_media_applies_player_output_filters() -> None:
+    """Route the PCM stream through ffmpeg when DSP or EQ filters are configured."""
+    player = cast("Any", create_player())
+    media = MagicMock(spec=PlayerMedia)
+    chunk = bytes(480 * 2 * 2)
+    source = pcm_source(chunk)
+    player.mass.streams.get_stream.return_value = source
+    player.mass.streams.audio.get_player_output_plan.return_value = MagicMock(
+        filter_params=["volume=-3dB"]
+    )
+    stub_broadcaster(player)
+
+    with patch(f"{PLAYER_MODULE}.get_ffmpeg_stream", return_value=pcm_source(chunk)) as ffmpeg:
+        await player.play_media(media)
+        await wait_for_idle(player)
+
+    assert ffmpeg.call_args.kwargs["audio_input"] is source
+    assert ffmpeg.call_args.kwargs["filter_params"] == ["volume=-3dB"]
+    player._broadcaster.send_pcm.assert_awaited_once_with(chunk)
+
+
+@pytest.mark.asyncio
+async def test_pause_takes_effect_between_slices_of_one_chunk() -> None:
+    """Send silence for the remaining slices of a chunk once pause was requested."""
+    player = cast("Any", create_player())
+    media = MagicMock(spec=PlayerMedia)
+    slice_bytes = 480 * 2 * 2
+    chunk = b"\x01\x00" * (slice_bytes // 2 * 3)
+    player.mass.streams.get_stream.return_value = pcm_source(chunk)
+    stub_broadcaster(player)
+    sent: list[bytes] = []
+
+    async def send_pcm(pcm: bytes) -> None:
+        sent.append(pcm)
+        if len(sent) == 1:
+            await player.pause()
+        elif len(sent) == 3:
+            await player.play()
+
+    player._broadcaster.send_pcm.side_effect = send_pcm
+
+    await player.play_media(media)
+    await wait_for_idle(player)
+
+    audio = b"\x01\x00" * (slice_bytes // 2)
+    silence = bytes(slice_bytes)
+    assert sent[0] == audio
+    assert sent[1:3] == [silence, silence]
+    assert sent[3:] == [audio, audio]
+
+
+@pytest.mark.asyncio
+async def test_elapsed_time_tracks_streamed_audio_and_survives_pause() -> None:
+    """Report cumulative playback time and freeze it, without paused silence, while paused."""
+    player = cast("Any", create_player())
+    media = MagicMock(spec=PlayerMedia)
+    player.mass.streams.get_stream.return_value = pcm_source(bytes(48_000 * 4))
+    stub_broadcaster(player)
+    paused_elapsed: list[float] = []
+
+    async def send_pcm(_pcm: bytes) -> None:
+        if player._streamed_seconds >= 0.5 and not paused_elapsed:
+            await player.pause()
+            paused_elapsed.append(player.elapsed_time)
+            await player.play()
+
+    player._broadcaster.send_pcm.side_effect = send_pcm
+
+    with patch.object(AuracastBroadcaster, "queued_seconds", PropertyMock(return_value=0.25)):
+        await player.play_media(media)
+        assert player.elapsed_time == 0.0
+        assert player.elapsed_time_last_updated is not None
+        await wait_for_idle(player)
+
+    assert paused_elapsed[0] == pytest.approx(0.25, abs=0.02)
+
+
+@pytest.mark.asyncio
+async def test_failed_controller_start_marks_player_unavailable() -> None:
+    """Report an unavailable player and the cause when the controller cannot be opened."""
+    player = cast("Any", create_player())
+    media = MagicMock(spec=PlayerMedia)
+    stub_broadcaster(player)
+    player._broadcaster.start.side_effect = OSError("could not open /dev/test")
+
+    with pytest.raises(PlayerUnavailableError, match="could not open /dev/test"):
+        await player.play_media(media)
+
+    assert not player.available
+    assert player._stream_task is None
+    assert player.needs_poll
+
+
+@pytest.mark.asyncio
+async def test_poll_restores_availability_when_serial_port_returns() -> None:
+    """Make the player available again once its serial port exists."""
+    player = cast("Any", create_player())
+    stub_broadcaster(player)
+    player._attr_available = False
+
+    with patch(f"{PLAYER_MODULE}.os.path.exists", return_value=False):
+        await player.poll()
+    assert not player.available
+
+    with patch(f"{PLAYER_MODULE}.os.path.exists", return_value=True):
+        await player.poll()
+    assert player.available
+    assert not player.needs_poll
+
+
+@pytest.mark.asyncio
+async def test_new_playback_waits_for_old_stream_teardown() -> None:
+    """Join the previous stream before closing its controller and opening the next broadcast."""
+    player = cast("Any", create_player())
+    media = MagicMock(spec=PlayerMedia)
+    stub_broadcaster(player)
+    events: list[str] = []
+    streaming = asyncio.Event()
+
+    async def endless_source() -> AsyncGenerator[bytes]:
+        try:
+            streaming.set()
+            await asyncio.Event().wait()
+            yield b""
+        finally:
+            events.append("source closed")
+
+    player._broadcaster.stop.side_effect = lambda: events.append("broadcaster stopped")
+    player._broadcaster.start.side_effect = lambda: events.append("broadcaster started")
+    player.mass.streams.get_stream.side_effect = [endless_source(), pcm_source()]
+
+    await player.play_media(media)
+    await streaming.wait()
+    events.clear()
+    await player.play_media(media)
+    await wait_for_idle(player)
+
+    assert events[:3] == ["source closed", "broadcaster stopped", "broadcaster started"]
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_stream_without_draining() -> None:
+    """Stop promptly instead of draining queued audio on an explicit stop."""
+    player = cast("Any", create_player())
+    media = MagicMock(spec=PlayerMedia)
+    stub_broadcaster(player)
+    streaming = asyncio.Event()
+
+    async def endless_source() -> AsyncGenerator[bytes]:
+        streaming.set()
+        await asyncio.Event().wait()
+        yield b""
+
+    player.mass.streams.get_stream.return_value = endless_source()
+
+    await player.play_media(media)
+    await streaming.wait()
+    await player.stop()
+
+    player._broadcaster.drain.assert_not_awaited()
+    assert player._stream_task is None
+    assert player.playback_state == PlaybackState.IDLE
 
 
 @pytest.mark.asyncio

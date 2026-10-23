@@ -6,6 +6,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from bumble import core as bumble_core
 from bumble import device as bumble_device
 from bumble import hci as bumble_hci
 from bumble import transport as bumble_transport
@@ -38,10 +39,25 @@ class FakeIsoStream:
     def __init__(self) -> None:
         """Initialize the packet log."""
         self.packets: list[bytes] = []
+        self.data_packet_queue = MagicMock(pending=0)
 
     async def write(self, packet: bytes) -> None:
         """Record one ISO SDU."""
         self.packets.append(packet)
+
+
+def create_bluetooth_device(
+    missing_feature: bumble_hci.LeFeatureMask | None = None,
+    missing_command: int | None = None,
+) -> MagicMock:
+    """Build a Bumble device stub supporting everything except the given capabilities."""
+    bluetooth_device = MagicMock()
+    bluetooth_device.supports_le_features.side_effect = lambda feature: feature != missing_feature
+    bluetooth_device.host.supports_command.side_effect = lambda op_code: op_code != missing_command
+    bluetooth_device.power_on = AsyncMock()
+    bluetooth_device.power_off = AsyncMock()
+    bluetooth_device.host.local_version = None
+    return bluetooth_device
 
 
 @pytest.mark.asyncio
@@ -118,10 +134,7 @@ async def test_start_uses_serial_transport_and_stop_closes_it(
     hci_transport = MagicMock()
     hci_transport.__iter__.return_value = (hci_source, hci_sink)
     hci_transport.close = AsyncMock()
-    bluetooth_device = MagicMock()
-    bluetooth_device.supports_le_periodic_advertising = True
-    bluetooth_device.power_on = AsyncMock()
-    bluetooth_device.power_off = AsyncMock()
+    bluetooth_device = create_bluetooth_device()
     bluetooth_device.host.local_version = (
         bumble_hci.HCI_Read_Local_Version_Information_ReturnParameters(
             status=bumble_hci.HCI_ErrorCode.SUCCESS,
@@ -160,18 +173,26 @@ async def test_start_uses_serial_transport_and_stop_closes_it(
 
 
 @pytest.mark.asyncio
-async def test_start_rejects_controller_without_periodic_advertising(
+@pytest.mark.parametrize(
+    ("missing_feature", "missing_command", "expected"),
+    [
+        (bumble_hci.LeFeatureMask.LE_PERIODIC_ADVERTISING, None, "LE Periodic Advertising"),
+        (bumble_hci.LeFeatureMask.ISOCHRONOUS_BROADCASTER, None, "Isochronous Broadcaster"),
+        (None, bumble_hci.HCI_LE_CREATE_BIG_COMMAND, "LE Create BIG"),
+        (None, bumble_hci.HCI_LE_SETUP_ISO_DATA_PATH_COMMAND, "LE Setup ISO Data Path"),
+    ],
+)
+async def test_start_rejects_controller_without_broadcast_support(
     monkeypatch: pytest.MonkeyPatch,
+    missing_feature: bumble_hci.LeFeatureMask | None,
+    missing_command: int | None,
+    expected: str,
 ) -> None:
-    """Reject incompatible hardware and release its opened transport."""
+    """Reject controllers that cannot broadcast and release their opened transport."""
     hci_transport = MagicMock()
     hci_transport.__iter__.return_value = (object(), object())
     hci_transport.close = AsyncMock()
-    bluetooth_device = MagicMock()
-    bluetooth_device.supports_le_periodic_advertising = False
-    bluetooth_device.power_on = AsyncMock()
-    bluetooth_device.power_off = AsyncMock()
-    bluetooth_device.host.local_version = None
+    bluetooth_device = create_bluetooth_device(missing_feature, missing_command)
     monkeypatch.setattr(bumble_transport, "open_transport", AsyncMock(return_value=hci_transport))
     monkeypatch.setattr(
         bumble_device.Device,
@@ -182,7 +203,7 @@ async def test_start_rejects_controller_without_periodic_advertising(
         BroadcastConfig(name="Test", transport_spec="serial:/dev/cu.test,1000000")
     )
 
-    with pytest.raises(RuntimeError, match="LE Periodic Advertising"):
+    with pytest.raises(bumble_core.NotSupportedError, match=expected):
         await broadcaster.start()
 
     bluetooth_device.power_off.assert_awaited_once()
@@ -194,15 +215,13 @@ async def test_start_rejects_controller_without_periodic_advertising(
 async def test_controller_probe_returns_support_and_releases_uart(
     monkeypatch: pytest.MonkeyPatch, supported: bool
 ) -> None:
-    """Probe LE Periodic Advertising support and release the serial transport."""
+    """Probe broadcast support and release the serial transport."""
     hci_transport = MagicMock()
     hci_transport.__iter__.return_value = (object(), object())
     hci_transport.close = AsyncMock()
-    bluetooth_device = MagicMock()
-    bluetooth_device.supports_le_periodic_advertising = supported
-    bluetooth_device.power_on = AsyncMock()
-    bluetooth_device.power_off = AsyncMock()
-    bluetooth_device.host.local_version = None
+    bluetooth_device = create_bluetooth_device(
+        None if supported else bumble_hci.LeFeatureMask.ISOCHRONOUS_BROADCASTER
+    )
     monkeypatch.setattr(bumble_transport, "open_transport", AsyncMock(return_value=hci_transport))
     monkeypatch.setattr(
         bumble_device.Device,
@@ -211,12 +230,64 @@ async def test_controller_probe_returns_support_and_releases_uart(
     )
 
     result = await probe_controller("/dev/cu.test", 1_000_000)
-    assert result is not None
-    assert result.supports_le_periodic_advertising is supported
+    assert result.supports_auracast is supported
+    assert result.missing_support == (() if supported else ("Isochronous Broadcaster",))
 
     bluetooth_device.power_on.assert_awaited_once()
     bluetooth_device.power_off.assert_awaited_once()
     hci_transport.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_controller_probe_propagates_open_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report a serial port that cannot be opened instead of treating it as incompatible."""
+    monkeypatch.setattr(
+        bumble_transport, "open_transport", AsyncMock(side_effect=OSError("port busy"))
+    )
+
+    with pytest.raises(OSError, match="port busy"):
+        await probe_controller("/dev/cu.test", 1_000_000)
+
+
+@pytest.mark.asyncio
+async def test_drain_pads_partial_frame_and_waits_for_transmission() -> None:
+    """Flush the buffered tail as a silent-padded frame before waiting for the queue."""
+    broadcaster = AuracastBroadcaster(
+        BroadcastConfig(name="Test", transport_spec="serial:/dev/test,1000000")
+    )
+    encoder = FakeEncoder()
+    streams = [FakeIsoStream(), FakeIsoStream()]
+    link = MagicMock()
+    link.drain = AsyncMock()
+    big = MagicMock()
+    big.bis_links = [link]
+    broadcaster_stub = cast("Any", broadcaster)
+    broadcaster_stub._encoder = encoder
+    broadcaster_stub._big = big
+    broadcaster_stub._streams = streams
+    broadcaster_stub._frame_bytes = 200
+    broadcaster_stub._bytes_per_bis = 100
+    broadcaster_stub._samples_per_frame = 480
+
+    await broadcaster.send_pcm(b"\x01" * 100)
+    await broadcaster.drain()
+
+    assert encoder.calls == [(b"\x01" * 100 + bytes(480 * 2 * 2 - 100), 200, 16)]
+    link.drain.assert_awaited_once()
+
+
+def test_queued_seconds_reports_pending_frames() -> None:
+    """Convert pending SDUs across all BIS streams into seconds of queued audio."""
+    broadcaster = AuracastBroadcaster(
+        BroadcastConfig(name="Test", transport_spec="serial:/dev/test,1000000")
+    )
+    streams = [FakeIsoStream(), FakeIsoStream()]
+    streams[0].data_packet_queue.pending = 128
+    cast("Any", broadcaster)._streams = streams
+
+    assert broadcaster.queued_seconds == pytest.approx(0.64)
 
 
 @pytest.mark.asyncio
