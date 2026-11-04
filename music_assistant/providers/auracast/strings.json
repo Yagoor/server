@@ -15,6 +15,14 @@
       "label": "Broadcast name",
       "description": "Name shown to nearby Auracast receivers."
     },
+    "advertising_rate": {
+      "label": "Advertising rate",
+      "description": "How often the broadcast announces itself to receivers. Fast (60 ms) lets receivers find and join the broadcast sooner. Slow (150 ms) uses less airtime and power and leaves more room for other Bluetooth traffic.",
+      "options": {
+        "fast": "Fast (60 ms)",
+        "slow": "Slow (150 ms)"
+      }
+    },
     "manufacturer_data": {
       "label": "Manufacturer data",
       "description": "Optional company ID and hex payload as ID:HEX. Separate multiple entries with semicolons."

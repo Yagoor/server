@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
-from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType
 
 from music_assistant.models.player_provider import PlayerProvider
 
 from .constants import (
+    ADVERTISING_RATE_FAST,
+    ADVERTISING_RATE_SLOW,
+    CONF_ADVERTISING_RATE,
     CONF_BAUDRATE,
     CONF_BROADCAST_NAME,
     CONF_MANUFACTURER_DATA,
     CONF_SERIAL_PORT,
+    DEFAULT_ADVERTISING_RATE,
     DEFAULT_BAUDRATE,
     DEFAULT_BROADCAST_NAME,
     MAX_BAUDRATE,
@@ -63,6 +67,20 @@ class AuracastProvider(PlayerProvider):
                     or DEFAULT_BROADCAST_NAME
                 ),
                 validate=validate_broadcast_name,
+                requires_reload=True,
+            ),
+            ConfigEntry(
+                key=CONF_ADVERTISING_RATE,
+                type=ConfigEntryType.STRING,
+                required=True,
+                default_value=str(
+                    self.get_setup_value(CONF_ADVERTISING_RATE, DEFAULT_ADVERTISING_RATE)
+                    or DEFAULT_ADVERTISING_RATE
+                ),
+                options=[
+                    ConfigValueOption(ADVERTISING_RATE_FAST),
+                    ConfigValueOption(ADVERTISING_RATE_SLOW),
+                ],
                 requires_reload=True,
             ),
             ConfigEntry(

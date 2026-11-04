@@ -25,6 +25,7 @@ async def test_setup_data_values_seed_provider_settings() -> None:
         "serial_port": "/dev/controller",
         "baudrate": 1_000_000,
         "broadcast_name": "Auracast test",
+        "advertising_rate": "slow",
         "manufacturer_data": "87:abcd",
     }
 

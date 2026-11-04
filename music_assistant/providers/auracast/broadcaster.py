@@ -14,6 +14,7 @@ from bumble.profiles import bap, le_audio, pbp
 from lc3 import BaseError as LC3Error
 from lc3 import Encoder
 
+from .constants import ADVERTISING_INTERVALS, DEFAULT_ADVERTISING_RATE, AdvertisingIntervals
 from .serial_hci import open_hci_transport
 
 if TYPE_CHECKING:
@@ -156,6 +157,7 @@ class BroadcastConfig:
     channels: int = 2
     presentation_delay_us: int = 40_000
     max_transport_latency_ms: int = 65
+    advertising_intervals: AdvertisingIntervals = ADVERTISING_INTERVALS[DEFAULT_ADVERTISING_RATE]
 
 
 class AuracastBroadcaster:
@@ -423,14 +425,14 @@ class AuracastBroadcaster:
                 advertising_event_properties=device.AdvertisingEventProperties(
                     is_connectable=False
                 ),
-                primary_advertising_interval_min=60,
-                primary_advertising_interval_max=60,
+                primary_advertising_interval_min=config.advertising_intervals.primary,
+                primary_advertising_interval_max=config.advertising_intervals.primary,
                 advertising_sid=0,
             ),
             advertising_data=advertising_data,
             periodic_advertising_parameters=device.PeriodicAdvertisingParameters(
-                periodic_advertising_interval_min=60,
-                periodic_advertising_interval_max=60,
+                periodic_advertising_interval_min=config.advertising_intervals.periodic,
+                periodic_advertising_interval_max=config.advertising_intervals.periodic,
             ),
             periodic_advertising_data=basic_announcement.get_advertising_data(),
             auto_restart=True,

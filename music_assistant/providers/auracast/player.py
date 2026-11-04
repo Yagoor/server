@@ -27,10 +27,13 @@ from .broadcaster import (
     parse_manufacturer_data,
 )
 from .constants import (
+    ADVERTISING_INTERVALS,
+    CONF_ADVERTISING_RATE,
     CONF_BAUDRATE,
     CONF_BROADCAST_NAME,
     CONF_MANUFACTURER_DATA,
     CONF_SERIAL_PORT,
+    DEFAULT_ADVERTISING_RATE,
     DEFAULT_BAUDRATE,
     DEFAULT_BROADCAST_NAME,
 )
@@ -122,6 +125,10 @@ class AuracastPlayer(Player):
                     )
                 ),
                 broadcast_id=broadcast_id,
+                advertising_intervals=ADVERTISING_INTERVALS.get(
+                    str(provider.config.get_value(CONF_ADVERTISING_RATE, DEFAULT_ADVERTISING_RATE)),
+                    ADVERTISING_INTERVALS[DEFAULT_ADVERTISING_RATE],
+                ),
             )
         )
         self._stream_task: asyncio.Task[None] | None = None

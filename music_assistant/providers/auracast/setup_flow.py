@@ -13,10 +13,14 @@ from music_assistant.models.setup_flow import SetupFlowError
 
 from .broadcaster import BROADCAST_ERRORS, CONTROLLER_STACK_SETUP_KEY, probe_controller
 from .constants import (
+    ADVERTISING_RATE_FAST,
+    ADVERTISING_RATE_SLOW,
+    CONF_ADVERTISING_RATE,
     CONF_BAUDRATE,
     CONF_BROADCAST_NAME,
     CONF_MANUFACTURER_DATA,
     CONF_SERIAL_PORT,
+    DEFAULT_ADVERTISING_RATE,
     DEFAULT_BAUDRATE,
     DEFAULT_BROADCAST_NAME,
     MAX_BAUDRATE,
@@ -104,6 +108,17 @@ async def _configure_controller(session: SetupSession, released_players: list[Pl
                     default_value=DEFAULT_BROADCAST_NAME,
                     value=setup_data.get(CONF_BROADCAST_NAME, DEFAULT_BROADCAST_NAME),
                     validate=validate_broadcast_name,
+                ),
+                ConfigEntry(
+                    key=CONF_ADVERTISING_RATE,
+                    type=ConfigEntryType.STRING,
+                    required=True,
+                    default_value=DEFAULT_ADVERTISING_RATE,
+                    value=setup_data.get(CONF_ADVERTISING_RATE, DEFAULT_ADVERTISING_RATE),
+                    options=[
+                        ConfigValueOption(ADVERTISING_RATE_FAST),
+                        ConfigValueOption(ADVERTISING_RATE_SLOW),
+                    ],
                 ),
                 ConfigEntry(
                     key=CONF_MANUFACTURER_DATA,
