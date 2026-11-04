@@ -86,6 +86,11 @@ async def test_setup_probes_only_the_selected_port(monkeypatch: pytest.MonkeyPat
     ]
     assert entries["baudrate"].validate is not None
     assert entries["manufacturer_data"].validate is not None
+    assert entries["advertising_rate"].default_value == "fast"
+    assert [option.value for option in entries["advertising_rate"].options] == [
+        "fast",
+        "slow",
+    ]
 
 
 @pytest.mark.asyncio

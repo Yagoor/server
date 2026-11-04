@@ -36,6 +36,16 @@ async def test_setup_data_values_seed_provider_settings() -> None:
 
 
 @pytest.mark.asyncio
+async def test_advertising_rate_defaults_to_fast() -> None:
+    """Offer the fast and slow presets and select fast unless the user chose otherwise."""
+    entries = await AuracastProvider.get_config_entries(cast("Any", create_provider({})))
+
+    entry = {entry.key: entry for entry in entries}["advertising_rate"]
+    assert entry.default_value == "fast"
+    assert [option.value for option in cast("Any", entry.options)] == ["fast", "slow"]
+
+
+@pytest.mark.asyncio
 async def test_serial_port_has_no_platform_specific_default() -> None:
     """Leave the serial port empty until the setup flow provides one."""
     entries = await AuracastProvider.get_config_entries(cast("Any", create_provider({})))

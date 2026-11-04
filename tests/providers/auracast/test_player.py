@@ -17,6 +17,7 @@ from music_assistant.providers.auracast.broadcaster import (
     CONTROLLER_STACK_SETUP_KEY,
     AuracastBroadcaster,
 )
+from music_assistant.providers.auracast.constants import AdvertisingIntervals
 from music_assistant.providers.auracast.player import (
     PCM_FORMAT,
     AuracastPlayer,
@@ -26,7 +27,7 @@ from music_assistant.providers.auracast.player import (
 PLAYER_MODULE = "music_assistant.providers.auracast.player"
 
 
-def create_player() -> AuracastPlayer:
+def create_player(config_values: dict[str, Any] | None = None) -> AuracastPlayer:
     """Build a player with a minimal provider and mass stub."""
     mass = MagicMock()
     mass.config.get_base_player_config.return_value = MagicMock()
@@ -37,9 +38,8 @@ def create_player() -> AuracastPlayer:
     provider.mass = mass
     provider.logger = logging.getLogger("test.auracast")
     provider.instance_id = "auracast_test"
-    provider.config.get_value.side_effect = lambda key, default=None: (
-        "/dev/test" if key == "serial_port" else default
-    )
+    values = {"serial_port": "/dev/test", **(config_values or {})}
+    provider.config.get_value.side_effect = lambda key, default=None: values.get(key, default)
     provider.get_setup_value.side_effect = lambda _key, default=None: default
     return AuracastPlayer(provider, "auracast_test")
 
@@ -482,3 +482,23 @@ def test_player_shows_controller_details_from_setup_probe() -> None:
     assert player_with_details.device_info.model == (
         "Host stack: Bumble; Controller stack: Bluetooth Core 5.4; company ID 0x0059"
     )
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, AdvertisingIntervals(primary=96, periodic=48)),
+        ("fast", AdvertisingIntervals(primary=96, periodic=48)),
+        ("slow", AdvertisingIntervals(primary=240, periodic=120)),
+        ("unknown", AdvertisingIntervals(primary=96, periodic=48)),
+    ],
+)
+def test_advertising_intervals_follow_the_advertising_rate(
+    configured: str | None, expected: AdvertisingIntervals
+) -> None:
+    """Map the fast and slow presets to their intervals, falling back to fast."""
+    values = {} if configured is None else {"advertising_rate": configured}
+
+    player = create_player(values)
+
+    assert player._broadcaster.config.advertising_intervals == expected

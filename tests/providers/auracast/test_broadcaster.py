@@ -19,6 +19,7 @@ from music_assistant.providers.auracast.broadcaster import (
     parse_manufacturer_data,
     probe_controller,
 )
+from music_assistant.providers.auracast.constants import AdvertisingIntervals
 
 
 class FakeEncoder:
@@ -384,3 +385,44 @@ async def test_manufacturer_data_is_added_to_extended_advertising() -> None:
     data = bluetooth_device.create_advertising_set.await_args.kwargs["advertising_data"]
     manufacturer_structure = bytes([3 + len(payload), 0xFF, 0x57, 0x00]) + payload
     assert manufacturer_structure in data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("intervals", "expected"),
+    [
+        (None, (96, 48)),
+        (AdvertisingIntervals(primary=240, periodic=120), (240, 120)),
+    ],
+)
+async def test_advertising_intervals_are_applied(
+    intervals: AdvertisingIntervals | None, expected: tuple[int, int]
+) -> None:
+    """Advertise at the configured intervals, defaulting to the 60 ms fast preset."""
+    config = BroadcastConfig(name="Test", serial_port="/dev/test", baudrate=1_000_000)
+    if intervals is not None:
+        config.advertising_intervals = intervals
+    broadcaster = AuracastBroadcaster(config)
+    advertising_set = MagicMock()
+    advertising_set.start_periodic = AsyncMock()
+    big = MagicMock()
+    big.bis_links = []
+    bluetooth_device = MagicMock()
+    bluetooth_device.create_advertising_set = AsyncMock(return_value=advertising_set)
+    bluetooth_device.create_big = AsyncMock(return_value=big)
+    broadcaster._device = bluetooth_device
+    broadcaster._bytes_per_bis = 100
+
+    await broadcaster._create_broadcast()
+
+    kwargs = bluetooth_device.create_advertising_set.await_args.kwargs
+    primary = kwargs["advertising_parameters"]
+    periodic = kwargs["periodic_advertising_parameters"]
+    assert (primary.primary_advertising_interval_min, primary.primary_advertising_interval_max) == (
+        expected[0],
+        expected[0],
+    )
+    assert (
+        periodic.periodic_advertising_interval_min,
+        periodic.periodic_advertising_interval_max,
+    ) == (expected[1], expected[1])
